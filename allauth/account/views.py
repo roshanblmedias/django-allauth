@@ -1,68 +1,61 @@
 from django.contrib import messages
+from django.shortcuts import render, redirect
+from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.contrib.auth.decorators import login_required
 from django.contrib.sites.shortcuts import get_current_site
-from django.core.exceptions import PermissionDenied
 from django.core.validators import validate_email
 from django.forms import ValidationError
-from django.http import Http404, HttpResponse, HttpResponseRedirect
+from django.http import (
+    Http404,
+    HttpResponsePermanentRedirect,
+    HttpResponseRedirect,
+)
 from django.urls import reverse, reverse_lazy
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from django.views.decorators.debug import sensitive_post_parameters
-from django.views.generic.base import TemplateView
+from django.views.generic.base import TemplateResponseMixin, TemplateView, View
 from django.views.generic.edit import FormView
 
-from allauth import app_settings as allauth_app_settings
-from allauth.account import app_settings
+from allauth.account import app_settings, signals
 from allauth.account.adapter import get_adapter
+from allauth.account.decorators import reauthentication_required
 from allauth.account.forms import (
     AddEmailForm,
     ChangePasswordForm,
-    ConfirmEmailVerificationCodeForm,
-    ConfirmLoginCodeForm,
     LoginForm,
     ReauthenticateForm,
-    RequestLoginCodeForm,
     ResetPasswordForm,
     ResetPasswordKeyForm,
     SetPasswordForm,
     SignupForm,
     UserTokenForm,
 )
-from allauth.account.internal import flows
-from allauth.account.internal.decorators import (
-    login_not_required,
-    login_stage_required,
-)
-from allauth.account.mixins import (
-    AjaxCapableProcessFormViewMixin,
-    CloseableSignupMixin,
-    LogoutFunctionalityMixin,
-    NextRedirectMixin,
-    RedirectAuthenticatedUserMixin,
-    _ajax_response,
-)
 from allauth.account.models import (
     EmailAddress,
     EmailConfirmation,
-    get_emailconfirmation_model,
+    EmailConfirmationHMAC,
 )
-from allauth.account.stages import (
-    EmailVerificationStage,
-    LoginByCodeStage,
-    LoginStageController,
+from allauth.account.reauthentication import (
+    record_authentication,
+    resume_request,
 )
 from allauth.account.utils import (
+    complete_signup,
+    get_login_redirect_url,
+    get_next_redirect_url,
+    logout_on_password_change,
+    passthrough_next_redirect_url,
     perform_login,
     send_email_confirmation,
     sync_user_email_addresses,
-    user_display,
+    url_str_to_user_pk,
 )
 from allauth.core import ratelimit
 from allauth.core.exceptions import ImmediateHttpResponse
-from allauth.core.internal.httpkit import redirect
+from allauth.core.internal.http import redirect
 from allauth.decorators import rate_limit
-from allauth.utils import get_form_class
+from allauth.utils import get_form_class, get_request_param
 
 
 INTERNAL_RESET_SESSION_KEY = "_password_reset_key"
@@ -73,27 +66,105 @@ sensitive_post_parameters_m = method_decorator(
 )
 
 
+def _ajax_response(request, response, form=None, data=None):
+    adapter = get_adapter()
+    if adapter.is_ajax(request):
+        if isinstance(response, HttpResponseRedirect) or isinstance(
+            response, HttpResponsePermanentRedirect
+        ):
+            redirect_to = response["Location"]
+        else:
+            redirect_to = None
+        response = adapter.ajax_response(
+            request, response, form=form, data=data, redirect_to=redirect_to
+        )
+    return response
+
+
+class RedirectAuthenticatedUserMixin(object):
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated and app_settings.AUTHENTICATED_LOGIN_REDIRECTS:
+            redirect_to = self.get_authenticated_redirect_url()
+            response = HttpResponseRedirect(redirect_to)
+            return _ajax_response(request, response)
+        else:
+            response = super(RedirectAuthenticatedUserMixin, self).dispatch(
+                request, *args, **kwargs
+            )
+        return response
+
+    def get_authenticated_redirect_url(self):
+        redirect_field_name = self.redirect_field_name
+        return get_login_redirect_url(
+            self.request,
+            url=self.get_success_url(),
+            redirect_field_name=redirect_field_name,
+        )
+
+
+class AjaxCapableProcessFormViewMixin(object):
+    def get(self, request, *args, **kwargs):
+        response = super(AjaxCapableProcessFormViewMixin, self).get(
+            request, *args, **kwargs
+        )
+        form = self.get_form()
+        return _ajax_response(
+            self.request, response, form=form, data=self._get_ajax_data_if()
+        )
+
+    def post(self, request, *args, **kwargs):
+        form_class = self.get_form_class()
+        form = self.get_form(form_class)
+        if form.is_valid():
+            response = self.form_valid(form)
+        else:
+            response = self.form_invalid(form)
+        return _ajax_response(
+            self.request, response, form=form, data=self._get_ajax_data_if()
+        )
+
+    def get_form(self, form_class=None):
+        form = getattr(self, "_cached_form", None)
+        if form is None:
+            form = super(AjaxCapableProcessFormViewMixin, self).get_form(form_class)
+            self._cached_form = form
+        return form
+
+    def _get_ajax_data_if(self):
+        return (
+            self.get_ajax_data()
+            if get_adapter(self.request).is_ajax(self.request)
+            else None
+        )
+
+    def get_ajax_data(self):
+        return None
+
+
+class LogoutFunctionalityMixin(object):
+    def logout(self):
+        adapter = get_adapter(self.request)
+        adapter.add_message(
+            self.request, messages.SUCCESS, "account/messages/logged_out.txt"
+        )
+        adapter.logout(self.request)
+
+
 class LoginView(
-    NextRedirectMixin,
-    RedirectAuthenticatedUserMixin,
-    AjaxCapableProcessFormViewMixin,
-    FormView,
+    RedirectAuthenticatedUserMixin, AjaxCapableProcessFormViewMixin, FormView
 ):
     form_class = LoginForm
     template_name = "account/login." + app_settings.TEMPLATE_EXTENSION
     success_url = None
+    redirect_field_name = REDIRECT_FIELD_NAME
 
-    @method_decorator(rate_limit(action="login"))
-    @method_decorator(login_not_required)
     @sensitive_post_parameters_m
     @method_decorator(never_cache)
     def dispatch(self, request, *args, **kwargs):
-        if allauth_app_settings.SOCIALACCOUNT_ONLY and request.method != "GET":
-            raise PermissionDenied()
-        return super().dispatch(request, *args, **kwargs)
+        return super(LoginView, self).dispatch(request, *args, **kwargs)
 
     def get_form_kwargs(self):
-        kwargs = super().get_form_kwargs()
+        kwargs = super(LoginView, self).get_form_kwargs()
         kwargs["request"] = self.request
         return kwargs
 
@@ -101,87 +172,305 @@ class LoginView(
         return get_form_class(app_settings.FORMS, "login", self.form_class)
 
     def form_valid(self, form):
-        redirect_url = self.get_success_url()
+        success_url = self.get_success_url()
         try:
-            return form.login(self.request, redirect_url=redirect_url)
+            return form.login(self.request, redirect_url=success_url)
         except ImmediateHttpResponse as e:
             return e.response
 
-    def get_context_data(self, **kwargs):
-        passkey_login_enabled = False
-        if allauth_app_settings.MFA_ENABLED:
-            from allauth.mfa import app_settings as mfa_settings
+    def get_success_url(self):
+        # Explicitly passed ?next= URL takes precedence
+        ret = (
+            get_next_redirect_url(self.request, self.redirect_field_name)
+            or self.success_url
+        )
+        return ret
 
-            passkey_login_enabled = mfa_settings.PASSKEY_LOGIN_ENABLED
-        ret = super().get_context_data(**kwargs)
-        signup_url = None
-        if not allauth_app_settings.SOCIALACCOUNT_ONLY:
-            signup_url = self.passthrough_next_url(reverse("account_signup"))
+    def get_context_data(self, **kwargs):
+        ret = super(LoginView, self).get_context_data(**kwargs)
+        signup_url = passthrough_next_redirect_url(
+            self.request, reverse("account_signup"), self.redirect_field_name
+        )
+        redirect_field_value = get_request_param(self.request, self.redirect_field_name)
         site = get_current_site(self.request)
 
         ret.update(
             {
                 "signup_url": signup_url,
                 "site": site,
-                "SOCIALACCOUNT_ENABLED": allauth_app_settings.SOCIALACCOUNT_ENABLED,
-                "SOCIALACCOUNT_ONLY": allauth_app_settings.SOCIALACCOUNT_ONLY,
-                "LOGIN_BY_CODE_ENABLED": app_settings.LOGIN_BY_CODE_ENABLED,
-                "PASSKEY_LOGIN_ENABLED": passkey_login_enabled,
+                "redirect_field_name": self.redirect_field_name,
+                "redirect_field_value": redirect_field_value,
             }
         )
-        if app_settings.LOGIN_BY_CODE_ENABLED:
-            request_login_code_url = self.passthrough_next_url(
-                reverse("account_request_login_code")
-            )
-            ret["request_login_code_url"] = request_login_code_url
         return ret
 
 
 login = LoginView.as_view()
 
 
+class CloseableSignupMixin(object):
+    template_name_signup_closed = (
+        "account/signup_closed." + app_settings.TEMPLATE_EXTENSION
+    )
+
+    def dispatch(self, request, *args, **kwargs):
+        try:
+            if not self.is_open():
+                return self.closed()
+        except ImmediateHttpResponse as e:
+            return e.response
+        return super(CloseableSignupMixin, self).dispatch(request, *args, **kwargs)
+
+    def is_open(self):
+        return get_adapter(self.request).is_open_for_signup(self.request)
+
+    def closed(self):
+        response_kwargs = {
+            "request": self.request,
+            "template": self.template_name_signup_closed,
+        }
+        return self.response_class(**response_kwargs)
+
+
+
+from django.core.mail import send_mail
+from django.urls import reverse
+from django.contrib.sites.shortcuts import get_current_site
+from django.utils.crypto import get_random_string
+from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
+from allauth.account.forms import BaseSignupForm, PasswordField
+from django import forms
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
+from django.utils.translation import gettext_lazy as _
+from django.core.mail import send_mail
+from django.conf import settings
+from django.urls import reverse
+from django.contrib.sites.shortcuts import get_current_site
+from django.utils.http import urlsafe_base64_encode
+from django.utils.encoding import force_bytes
+from userprofiles.signals import send_new_user_welcome_email
+import requests
+import json
+
+
+def send_verification_email(password, email, posted_data):
+        current_site = get_current_site(posted_data)
+        uidemail = urlsafe_base64_encode(force_bytes(email))
+        uidpassword = urlsafe_base64_encode(force_bytes(password))
+        verification_link = f"http://{current_site.domain}{reverse('verify_email', kwargs={'uidb64': uidemail, 'password': uidpassword})}"
+
+        # Define the URL and payload
+        post_url = "https://api.createsend.com/api/v3.2/transactional/smartemail/221b77d0-ceda-4577-85f1-972e0ff2fd32/send"
+        payload = {
+            "To": [email],  # Adding name format as per the original example
+            "Data": {
+                "EMAIL": email,
+                "ACTIVATION URL": verification_link
+            },
+            "ConsentToTrack": "no"  # Choose either "no", "yes", or "unchanged" here
+        }
+
+        # Ensure the payload is sent as JSON
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        # Make the POST request
+        email_response = requests.post(
+            post_url,
+            headers=headers,
+            json=payload,  # Use `json` parameter to automatically serialize as JSON
+            auth=(settings.CREATESEND_API_KEY, 'x')
+        )
+
+        # Check response
+        print("-----mail response------", email_response.status_code)
+        print("-----response content------", email_response.json())
+
+def send_welcome_email(temp_email):
+        # Email message
+        # subject = 'Welcome Email'
+        # print("----inside mail------")
+        
+        # html_message = f'''
+        #             <html>
+        #             <body style="font-family: Arial, sans-serif; background-color: #f1f5f8; padding: 20px;">
+        #             <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+                    
+        #                     <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 20px; text-align: center;">
+        #                     <img src="https://uppbod-staging.fra1.cdn.digitaloceanspaces.com/uppbod-staging/static/img/logo.svg" alt="Uppbod.com" style="width: 150px; margin-bottom: 20px;" />
+        #                     <h2 style="color: #333;">Welcome to Uppbod.com!</h2>
+        #                     <p style="color: #555;">Hello <a href="mailto:{temp_email}" style="color: #1a73e8;">{temp_email}</a>,</p>
+        #                     <p style="color: #555;">Thank you for joining Uppbod.com! We're thrilled to have you on board. Start exploring, bidding, and winning with our wide range of auction items. Your journey begins here!</p>
+        #                     <a href="https://uppbod.com" style="display: inline-block; padding: 12px 20px; background-color: #4a90e2; color: #ffffff; text-decoration: none; border-radius: 5px; font-weight: bold; margin-top: 20px;">Visit Uppbod.com</a>
+        #                     <p style="color: #999; font-size: 12px; margin-top: 20px;">If you have any questions, feel free to reach out to us at any time. We're here to help!</p>
+        #                     <div style="margin-top: 20px;">
+        #                         <!-- Add icon library -->
+        #                         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+        #                         <a href="#" class="fa fa-facebook" style="padding: 10px;
+        #                             font-size: 10px;
+        #                             width: 10px; margin-right: 20px;
+        #                             text-align: center;
+        #                             text-decoration: none;
+        #                             border-radius: 100%;
+        #                             color:white;
+        #                             background-color: #367cba;"></a>
+        #                         <a href="#" class="ks fa fa-twitter" style="padding: 10px;
+        #                             font-size: 10px;
+        #                             width: 10px; margin-right: 20px;
+        #                             text-align: center;
+        #                             text-decoration: none;
+        #                             border-radius: 100%;
+        #                             color:white;
+        #                             background-color: #54e34f;"></a>
+        #                         <a href="#" class="ps fa fa-instagram" style="padding: 10px;
+        #                             font-size: 10px; margin-right: 20px;
+        #                             width: 10px;
+        #                             text-align: center;
+        #                             text-decoration: none;
+        #                             border-radius: 100%;
+        #                             color:white;
+        #                             background-color: #e63e54;"></a>
+        #                     </div>
+        #                 </div>
+        #             </body>
+        #             </html>
+        #             '''
+        # # Send email
+        # send_mail(
+        #     subject,
+        #     '',
+        #     settings.DEFAULT_FROM_EMAIL,
+        #     [temp_email],
+        #     fail_silently=False,
+        #     html_message=html_message
+        # )
+        
+        # Define the URL and payload
+        post_url = "https://api.createsend.com/api/v3.2/transactional/smartemail/c69ff84c-9f3c-499e-9c11-fedd7b8d5cf0/send"
+        payload = {
+                "To": [temp_email],
+                "ConsentToTrack": "no"
+            }
+
+        # Ensure the payload is sent as JSON
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        # Make the POST request
+        email_response = requests.post(
+            post_url,
+            headers=headers,
+            json=payload,  # Use `json` parameter to automatically serialize as JSON
+            auth=(settings.CREATESEND_API_KEY, 'x')
+        )
+
+        # Check response
+        print("-----mail response------", email_response.status_code)
+        print("-----response content------", email_response.json())
+        
+        
+        
+        
+from django.contrib.auth import get_user_model
+from django.shortcuts import redirect
+from django.utils.http import urlsafe_base64_decode
+from allauth.account.models import EmailAddress
+
+def verify_email(request, uidb64, password):
+    try:
+        email = urlsafe_base64_decode(uidb64).decode()
+        password = urlsafe_base64_decode(password).decode()
+        # print("temp_email-----",email)
+        # print("password-----",password)
+        # Retrieve email and password from session
+        temp_email = email
+        temp_password = password
+        # print("temp_email-----",temp_email)
+        # print("temp_password-------",temp_password)
+        if temp_email:
+            User = get_user_model()
+            user = User.objects.create_user(
+                email=temp_email,
+                password=temp_password,
+            )
+            print("my mail-----",temp_email)
+        send_welcome_email(temp_email)
+        print("-----------Welcome mail-----------")
+        # Redirect to success page
+        return redirect('verification_success')
+    except Exception as e:
+        print(f"Error during verification: {e}")
+
+    # Redirect to error page if verification fails
+    return redirect('verification_error')
+    
+    
+@method_decorator(rate_limit(action="signup"), name="dispatch")
 class SignupView(
     RedirectAuthenticatedUserMixin,
     CloseableSignupMixin,
-    NextRedirectMixin,
     AjaxCapableProcessFormViewMixin,
     FormView,
 ):
     template_name = "account/signup." + app_settings.TEMPLATE_EXTENSION
     form_class = SignupForm
+    redirect_field_name = REDIRECT_FIELD_NAME
+    success_url = None
 
-    @method_decorator(rate_limit(action="signup"))
-    @method_decorator(login_not_required)
     @sensitive_post_parameters_m
     @method_decorator(never_cache)
     def dispatch(self, request, *args, **kwargs):
-        return super().dispatch(request, *args, **kwargs)
+        return super(SignupView, self).dispatch(request, *args, **kwargs)
 
     def get_form_class(self):
         return get_form_class(app_settings.FORMS, "signup", self.form_class)
 
+    # def get_success_url(self):
+    #     # Explicitly passed ?next= URL takes precedence
+    #     ret = (
+    #         get_next_redirect_url(self.request, self.redirect_field_name)
+    #         or self.success_url
+    #     )
+    #     return ret
+
     def form_valid(self, form):
-        self.user, resp = form.try_save(self.request)
-        if resp:
-            return resp
-        try:
-            redirect_url = self.get_success_url()
-            return flows.signup.complete_signup(
-                self.request,
-                user=self.user,
-                redirect_url=redirect_url,
-                by_passkey=form.by_passkey,
-            )
-        except ImmediateHttpResponse as e:
-            return e.response
+        posted_data = self.request  # This is the raw posted data dictionary
 
+        # Example: Access specific fields from cleaned form data
+        email = form.cleaned_data.get("email")
+        password = form.cleaned_data.get("password1")  # assuming you use 'password1' as the form field name
+        print("email---",email)
+        print("password---",password)
+        
+        # Send verification email
+        send_verification_email(password, email, self.request)
+        # Print or log posted data for debugging (only for development)
+        print("Posted data:", posted_data)
+        return redirect('sigup_reponse')
+        
+        # # Call the function to send a verification email
+        # send_verification_email(email, self.request)
+        
+        
+        # self.user, resp = form.try_save(self.request)
+        # if resp:
+        #     return resp
+        # try:
+        #     return complete_signup(
+        #         self.request,
+        #         self.user,
+        #         app_settings.EMAIL_VERIFICATION,
+        #         self.get_success_url(),
+        #     )
+        # except ImmediateHttpResponse as e:
+        #     return e.response
+        
     def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        passkey_signup_enabled = False
-        if allauth_app_settings.MFA_ENABLED:
-            from allauth.mfa import app_settings as mfa_settings
-
-            passkey_signup_enabled = mfa_settings.PASSKEY_SIGNUP_ENABLED
+        ret = super(SignupView, self).get_context_data(**kwargs)
         form = ret["form"]
         email = self.request.session.get("account_verified_email")
         if email:
@@ -190,23 +479,18 @@ class SignupView(
                 email_keys.append("email2")
             for email_key in email_keys:
                 form.fields[email_key].initial = email
-        login_url = self.passthrough_next_url(reverse("account_login"))
-        signup_url = self.passthrough_next_url(reverse("account_signup"))
-        signup_by_passkey_url = None
-        if passkey_signup_enabled:
-            signup_by_passkey_url = self.passthrough_next_url(
-                reverse("account_signup_by_passkey")
-            )
+        login_url = passthrough_next_redirect_url(
+            self.request, reverse("account_login"), self.redirect_field_name
+        )
+        redirect_field_name = self.redirect_field_name
         site = get_current_site(self.request)
+        redirect_field_value = get_request_param(self.request, redirect_field_name)
         ret.update(
             {
                 "login_url": login_url,
-                "signup_url": signup_url,
-                "signup_by_passkey_url": signup_by_passkey_url,
+                "redirect_field_name": redirect_field_name,
+                "redirect_field_value": redirect_field_value,
                 "site": site,
-                "SOCIALACCOUNT_ENABLED": allauth_app_settings.SOCIALACCOUNT_ENABLED,
-                "SOCIALACCOUNT_ONLY": allauth_app_settings.SOCIALACCOUNT_ONLY,
-                "PASSKEY_SIGNUP_ENABLED": passkey_signup_enabled,
             }
         )
         return ret
@@ -228,121 +512,153 @@ class SignupView(
 signup = SignupView.as_view()
 
 
-class SignupByPasskeyView(SignupView):
-    template_name = "account/signup_by_passkey." + app_settings.TEMPLATE_EXTENSION
+# class ConfirmEmailView(TemplateResponseMixin, LogoutFunctionalityMixin, View):
+#     template_name = "account/email_confirm." + app_settings.TEMPLATE_EXTENSION
 
-    def get_form_kwargs(self):
-        ret = super().get_form_kwargs()
-        ret["by_passkey"] = True
-        return ret
+#     def get(self, *args, **kwargs):
+#         try:
+#             self.object = self.get_object()
+#             if app_settings.CONFIRM_EMAIL_ON_GET:
+#                 return self.post(*args, **kwargs)
+#         except Http404:
+#             self.object = None
+#         ctx = self.get_context_data()
+#         return self.render_to_response(ctx)
+
+#     def post(self, *args, **kwargs):
+#         self.object = confirmation = self.get_object()
+#         email_address = confirmation.confirm(self.request)
+#         if not email_address:
+#             get_adapter(self.request).add_message(
+#                 self.request,
+#                 messages.ERROR,
+#                 "account/messages/email_confirmation_failed.txt",
+#                 {"email": confirmation.email_address.email},
+#             )
+#             return self.respond(False)
+
+#         # In the event someone clicks on an email confirmation link
+#         # for one account while logged into another account,
+#         # logout of the currently logged in account.
+#         if (
+#             self.request.user.is_authenticated
+#             and self.request.user.pk != confirmation.email_address.user_id
+#         ):
+#             self.logout()
+
+#         get_adapter(self.request).add_message(
+#             self.request,
+#             messages.SUCCESS,
+#             "account/messages/email_confirmed.txt",
+#             {"email": confirmation.email_address.email},
+#         )
+#         if app_settings.LOGIN_ON_EMAIL_CONFIRMATION:
+#             resp = self.login_on_confirm(confirmation)
+#             if resp is not None:
+#                 return resp
+#         # Don't -- allauth doesn't touch is_active so that sys admin can
+#         # use it to block users et al
+#         #
+#         # user = confirmation.email_address.user
+#         # user.is_active = True
+#         # user.save()
+#         return self.respond(True)
+
+#     def respond(self, success):
+#         redirect_url = self.get_redirect_url()
+#         if not redirect_url:
+#             ctx = self.get_context_data()
+#             return self.render_to_response(ctx)
+#         return redirect(redirect_url)
+
+#     def login_on_confirm(self, confirmation):
+#         """
+#         Simply logging in the user may become a security issue. If you
+#         do not take proper care (e.g. don't purge used email
+#         confirmations), a malicious person that got hold of the link
+#         will be able to login over and over again and the user is
+#         unable to do anything about it. Even restoring their own mailbox
+#         security will not help, as the links will still work. For
+#         password reset this is different, this mechanism works only as
+#         long as the attacker has access to the mailbox. If they no
+#         longer has access they cannot issue a password request and
+#         intercept it. Furthermore, all places where the links are
+#         listed (log files, but even Google Analytics) all of a sudden
+#         need to be secured. Purging the email confirmation once
+#         confirmed changes the behavior -- users will not be able to
+#         repeatedly confirm (in case they forgot that they already
+#         clicked the mail).
+
+#         All in all, opted for storing the user that is in the process
+#         of signing up in the session to avoid all of the above.  This
+#         may not 100% work in case the user closes the browser (and the
+#         session gets lost), but at least we're secure.
+#         """
+#         user_pk = None
+#         user_pk_str = get_adapter(self.request).unstash_user(self.request)
+#         if user_pk_str:
+#             user_pk = url_str_to_user_pk(user_pk_str)
+#         user = confirmation.email_address.user
+#         if user_pk == user.pk and self.request.user.is_anonymous:
+#             return perform_login(
+#                 self.request,
+#                 user,
+#                 app_settings.EmailVerificationMethod.NONE,
+#                 # passed as callable, as this method
+#                 # depends on the authenticated state
+#                 redirect_url=self.get_redirect_url,
+#             )
+
+#         return None
+
+#     def get_object(self, queryset=None):
+#         key = self.kwargs["key"]
+#         emailconfirmation = EmailConfirmationHMAC.from_key(key)
+#         if not emailconfirmation:
+#             if queryset is None:
+#                 queryset = self.get_queryset()
+#             try:
+#                 emailconfirmation = queryset.get(key=key.lower())
+#             except EmailConfirmation.DoesNotExist:
+#                 raise Http404()
+#         return emailconfirmation
+
+#     def get_queryset(self):
+#         qs = EmailConfirmation.objects.all_valid()
+#         qs = qs.select_related("email_address__user")
+#         return qs
+
+#     def get_context_data(self, **kwargs):
+#         ctx = kwargs
+#         site = get_current_site(self.request)
+#         ctx.update(
+#             {
+#                 "site": site,
+#                 "confirmation": self.object,
+#                 "can_confirm": self.object
+#                 and self.object.email_address.can_set_verified(),
+#             }
+#         )
+#         if self.object:
+#             ctx["email"] = self.object.email_address.email
+#         return ctx
+
+#     def get_redirect_url(self):
+#         return get_adapter(self.request).get_email_confirmation_redirect_url(
+#             self.request
+#         )
 
 
-signup_by_passkey = SignupByPasskeyView.as_view()
+# confirm_email = ConfirmEmailView.as_view()
 
 
-@method_decorator(login_not_required, name="dispatch")
-class ConfirmEmailView(NextRedirectMixin, LogoutFunctionalityMixin, TemplateView):
-    template_name = "account/email_confirm." + app_settings.TEMPLATE_EXTENSION
-
-    def get(self, *args, **kwargs):
-        try:
-            self.object = self.get_object()
-            self.logout_other_user(self.object)
-            if app_settings.CONFIRM_EMAIL_ON_GET:
-                return self.post(*args, **kwargs)
-        except Http404:
-            self.object = None
-        ctx = self.get_context_data()
-        if not self.object and get_adapter().is_ajax(self.request):
-            resp = HttpResponse()
-            resp.status_code = 400
-        else:
-            resp = self.render_to_response(ctx)
-        return _ajax_response(self.request, resp, data=self.get_ajax_data())
-
-    def logout_other_user(self, confirmation):
-        """
-        In the event someone clicks on an email confirmation link
-        for one account while logged into another account,
-        logout of the currently logged in account.
-        """
-        if (
-            self.request.user.is_authenticated
-            and self.request.user.pk != confirmation.email_address.user_id
-        ):
-            self.logout()
-
-    def post(self, *args, **kwargs):
-        self.object = verification = self.get_object()
-        email_address, response = flows.email_verification.verify_email_and_resume(
-            self.request, verification
-        )
-        if response:
-            return response
-        if not email_address:
-            return self.respond(False)
-
-        self.logout_other_user(self.object)
-        return self.respond(True)
-
-    def respond(self, success):
-        redirect_url = self.get_redirect_url()
-        if not redirect_url:
-            ctx = self.get_context_data()
-            return self.render_to_response(ctx)
-        return redirect(redirect_url)
-
-    def get_object(self, queryset=None):
-        key = self.kwargs["key"]
-        model = get_emailconfirmation_model()
-        emailconfirmation = model.from_key(key)
-        if not emailconfirmation:
-            raise Http404()
-        return emailconfirmation
-
-    def get_queryset(self):
-        qs = EmailConfirmation.objects.all_valid()
-        qs = qs.select_related("email_address__user")
-        return qs
-
-    def get_ajax_data(self):
-        ret = {
-            "can_confirm": bool(self.object),
-        }
-        if self.object:
-            ret["email"] = self.object.email_address.email
-            ret["user"] = {"display": user_display(self.object.email_address.user)}
-        return ret
-
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        site = get_current_site(self.request)
-        ctx.update(
-            {
-                "site": site,
-                "confirmation": self.object,
-                "can_confirm": self.object
-                and self.object.email_address.can_set_verified(),
-            }
-        )
-        if self.object:
-            ctx["email"] = self.object.email_address.email
-        return ctx
-
-    def get_redirect_url(self):
-        url = self.get_next_url()
-        if not url:
-            url = get_adapter(self.request).get_email_verification_redirect_url(
-                self.object.email_address,
-            )
-        return url
-
-
-confirm_email = ConfirmEmailView.as_view()
-
-
-@method_decorator(login_required, name="dispatch")
 @method_decorator(rate_limit(action="manage_email"), name="dispatch")
+@method_decorator(
+    reauthentication_required(
+        allow_get=True, enabled=lambda request: app_settings.REAUTHENTICATION_REQUIRED
+    ),
+    name="dispatch",
+)
 class EmailView(AjaxCapableProcessFormViewMixin, FormView):
     template_name = (
         "account/email_change." if app_settings.CHANGE_EMAIL else "account/email."
@@ -354,9 +670,8 @@ class EmailView(AjaxCapableProcessFormViewMixin, FormView):
         return get_form_class(app_settings.FORMS, "add_email", self.form_class)
 
     def dispatch(self, request, *args, **kwargs):
-        self._did_send_verification_email = False
         sync_user_email_addresses(request.user)
-        return super().dispatch(request, *args, **kwargs)
+        return super(EmailView, self).dispatch(request, *args, **kwargs)
 
     def get_form_kwargs(self):
         kwargs = super(EmailView, self).get_form_kwargs()
@@ -364,14 +679,25 @@ class EmailView(AjaxCapableProcessFormViewMixin, FormView):
         return kwargs
 
     def form_valid(self, form):
-        flows.manage_email.add_email(self.request, form)
-        self._did_send_verification_email = True
-        return super().form_valid(form)
+        email_address = form.save(self.request)
+        get_adapter(self.request).add_message(
+            self.request,
+            messages.INFO,
+            "account/messages/email_confirmation_sent.txt",
+            {"email": form.cleaned_data["email"]},
+        )
+        signals.email_added.send(
+            sender=self.request.user.__class__,
+            request=self.request,
+            user=self.request.user,
+            email_address=email_address,
+        )
+        return super(EmailView, self).form_valid(form)
 
     def post(self, request, *args, **kwargs):
         res = None
         if "action_add" in request.POST:
-            res = super().post(request, *args, **kwargs)
+            res = super(EmailView, self).post(request, *args, **kwargs)
         elif request.POST.get("email"):
             if "action_send" in request.POST:
                 res = self._action_send(request)
@@ -379,7 +705,6 @@ class EmailView(AjaxCapableProcessFormViewMixin, FormView):
                 res = self._action_remove(request)
             elif "action_primary" in request.POST:
                 res = self._action_primary(request)
-
             res = res or HttpResponseRedirect(self.get_success_url())
             # Given that we bypassed AjaxCapableProcessFormViewMixin,
             # we'll have to call invoke it manually...
@@ -407,20 +732,74 @@ class EmailView(AjaxCapableProcessFormViewMixin, FormView):
             send_email_confirmation(
                 self.request, request.user, email=email_address.email
             )
-            self._did_send_verification_email = True
-        if app_settings.EMAIL_VERIFICATION_BY_CODE_ENABLED:
-            return HttpResponseRedirect(reverse("account_email_verification_sent"))
 
     def _action_remove(self, request, *args, **kwargs):
         email_address = self._get_email_address(request)
         if email_address:
-            if flows.manage_email.delete_email(request, email_address):
+            adapter = get_adapter()
+            if not adapter.can_delete_email(email_address):
+                adapter.add_message(
+                    request,
+                    messages.ERROR,
+                    "account/messages/cannot_delete_primary_email.txt",
+                    {"email": email_address.email},
+                )
+            else:
+                email_address.remove()
+                signals.email_removed.send(
+                    sender=request.user.__class__,
+                    request=request,
+                    user=request.user,
+                    email_address=email_address,
+                )
+                adapter.add_message(
+                    request,
+                    messages.SUCCESS,
+                    "account/messages/email_deleted.txt",
+                    {"email": email_address.email},
+                )
                 return HttpResponseRedirect(self.get_success_url())
 
     def _action_primary(self, request, *args, **kwargs):
         email_address = self._get_email_address(request)
         if email_address:
-            if flows.manage_email.mark_as_primary(request, email_address):
+            # Not primary=True -- Slightly different variation, don't
+            # require verified unless moving from a verified
+            # address. Ignore constraint if previous primary email
+            # address is not verified.
+            if (
+                not email_address.verified
+                and EmailAddress.objects.filter(
+                    user=request.user, verified=True
+                ).exists()
+            ):
+                get_adapter().add_message(
+                    request,
+                    messages.ERROR,
+                    "account/messages/unverified_primary_email.txt",
+                )
+            else:
+                # Sending the old primary address to the signal
+                # adds a db query.
+                try:
+                    from_email_address = EmailAddress.objects.get(
+                        user=request.user, primary=True
+                    )
+                except EmailAddress.DoesNotExist:
+                    from_email_address = None
+                email_address.set_as_primary()
+                get_adapter().add_message(
+                    request,
+                    messages.SUCCESS,
+                    "account/messages/primary_email_set.txt",
+                )
+                signals.email_changed.send(
+                    sender=request.user.__class__,
+                    request=request,
+                    user=request.user,
+                    from_email_address=from_email_address,
+                    to_email_address=email_address,
+                )
                 return HttpResponseRedirect(self.get_success_url())
 
     def get_context_data(self, **kwargs):
@@ -467,67 +846,77 @@ class EmailView(AjaxCapableProcessFormViewMixin, FormView):
             )
         return data
 
-    def get_success_url(self):
-        if (
-            self._did_send_verification_email
-            and app_settings.EMAIL_VERIFICATION_BY_CODE_ENABLED
-        ):
-            return reverse("account_email_verification_sent")
-        return self.success_url
+
+email = login_required(EmailView.as_view())
 
 
-email = EmailView.as_view()
-
-
-@method_decorator(login_required, name="dispatch")
 @method_decorator(rate_limit(action="change_password"), name="dispatch")
-class PasswordChangeView(AjaxCapableProcessFormViewMixin, NextRedirectMixin, FormView):
+class PasswordChangeView(AjaxCapableProcessFormViewMixin, FormView):
     template_name = "account/password_change." + app_settings.TEMPLATE_EXTENSION
     form_class = ChangePasswordForm
+    success_url = reverse_lazy("account_change_password")
 
     def get_form_class(self):
         return get_form_class(app_settings.FORMS, "change_password", self.form_class)
 
     @sensitive_post_parameters_m
     def dispatch(self, request, *args, **kwargs):
-        if not self.request.user.has_usable_password():
+        return super(PasswordChangeView, self).dispatch(request, *args, **kwargs)
+
+    def render_to_response(self, context, **response_kwargs):
+        if self.request.user.is_anonymous:
+            # We end up here when `ACCOUNT_LOGOUT_ON_PASSWORD_CHANGE = True`.
+            redirect_url = get_adapter(self.request).get_logout_redirect_url(
+                self.request
+            )
+            return HttpResponseRedirect(redirect_url)
+        elif not self.request.user.has_usable_password():
             return HttpResponseRedirect(reverse("account_set_password"))
-        return super().dispatch(request, *args, **kwargs)
+        return super(PasswordChangeView, self).render_to_response(
+            context, **response_kwargs
+        )
 
     def get_form_kwargs(self):
-        kwargs = super().get_form_kwargs()
+        kwargs = super(PasswordChangeView, self).get_form_kwargs()
         kwargs["user"] = self.request.user
         return kwargs
 
-    def get_default_success_url(self):
-        return get_adapter().get_password_change_redirect_url(self.request)
-
     def form_valid(self, form):
         form.save()
-        flows.password_change.finalize_password_change(self.request, form.user)
-        return super().form_valid(form)
+        logout_on_password_change(self.request, form.user)
+        get_adapter(self.request).add_message(
+            self.request,
+            messages.SUCCESS,
+            "account/messages/password_changed.txt",
+        )
+        signals.password_changed.send(
+            sender=self.request.user.__class__,
+            request=self.request,
+            user=self.request.user,
+        )
+        return super(PasswordChangeView, self).form_valid(form)
 
     def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
+        ret = super(PasswordChangeView, self).get_context_data(**kwargs)
         # NOTE: For backwards compatibility
         ret["password_change_form"] = ret.get("form")
         # (end NOTE)
         return ret
 
 
-password_change = PasswordChangeView.as_view()
+password_change = login_required(PasswordChangeView.as_view())
 
 
-@method_decorator(login_required, name="dispatch")
 @method_decorator(
     # NOTE: 'change_password' (iso 'set_') is intentional, there is no need to
     # differentiate between set and change.
     rate_limit(action="change_password"),
     name="dispatch",
 )
-class PasswordSetView(AjaxCapableProcessFormViewMixin, NextRedirectMixin, FormView):
+class PasswordSetView(AjaxCapableProcessFormViewMixin, FormView):
     template_name = "account/password_set." + app_settings.TEMPLATE_EXTENSION
     form_class = SetPasswordForm
+    success_url = reverse_lazy("account_set_password")
 
     def get_form_class(self):
         return get_form_class(app_settings.FORMS, "set_password", self.form_class)
@@ -536,37 +925,48 @@ class PasswordSetView(AjaxCapableProcessFormViewMixin, NextRedirectMixin, FormVi
     def dispatch(self, request, *args, **kwargs):
         if self.request.user.has_usable_password():
             return HttpResponseRedirect(reverse("account_change_password"))
-        return super().dispatch(request, *args, **kwargs)
+        return super(PasswordSetView, self).dispatch(request, *args, **kwargs)
+
+    def render_to_response(self, context, **response_kwargs):
+        return super(PasswordSetView, self).render_to_response(
+            context, **response_kwargs
+        )
 
     def get_form_kwargs(self):
-        kwargs = super().get_form_kwargs()
+        kwargs = super(PasswordSetView, self).get_form_kwargs()
         kwargs["user"] = self.request.user
         return kwargs
 
-    def get_default_success_url(self):
-        return get_adapter().get_password_change_redirect_url(self.request)
-
     def form_valid(self, form):
         form.save()
-        flows.password_change.finalize_password_set(self.request, form.user)
-        return super().form_valid(form)
+        logout_on_password_change(self.request, form.user)
+        get_adapter(self.request).add_message(
+            self.request, messages.SUCCESS, "account/messages/password_set.txt"
+        )
+        signals.password_set.send(
+            sender=self.request.user.__class__,
+            request=self.request,
+            user=self.request.user,
+        )
+        return super(PasswordSetView, self).form_valid(form)
 
     def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
+        ret = super(PasswordSetView, self).get_context_data(**kwargs)
         # NOTE: For backwards compatibility
         ret["password_set_form"] = ret.get("form")
         # (end NOTE)
         return ret
 
 
-password_set = PasswordSetView.as_view()
+password_set = login_required(PasswordSetView.as_view())
 
 
-@method_decorator(login_not_required, name="dispatch")
-class PasswordResetView(NextRedirectMixin, AjaxCapableProcessFormViewMixin, FormView):
+@method_decorator(rate_limit(action="reset_password"), name="dispatch")
+class PasswordResetView(AjaxCapableProcessFormViewMixin, FormView):
     template_name = "account/password_reset." + app_settings.TEMPLATE_EXTENSION
     form_class = ResetPasswordForm
     success_url = reverse_lazy("account_reset_password_done")
+    redirect_field_name = REDIRECT_FIELD_NAME
 
     def get_form_class(self):
         return get_form_class(app_settings.FORMS, "reset_password", self.form_class)
@@ -574,17 +974,19 @@ class PasswordResetView(NextRedirectMixin, AjaxCapableProcessFormViewMixin, Form
     def form_valid(self, form):
         r429 = ratelimit.consume_or_429(
             self.request,
-            action="reset_password",
+            action="reset_password_email",
             key=form.cleaned_data["email"].lower(),
         )
         if r429:
             return r429
         form.save(self.request)
-        return super().form_valid(form)
+        return super(PasswordResetView, self).form_valid(form)
 
     def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        login_url = self.passthrough_next_url(reverse("account_login"))
+        ret = super(PasswordResetView, self).get_context_data(**kwargs)
+        login_url = passthrough_next_redirect_url(
+            self.request, reverse("account_login"), self.redirect_field_name
+        )
         # NOTE: For backwards compatibility
         ret["password_reset_form"] = ret.get("form")
         # (end NOTE)
@@ -595,7 +997,6 @@ class PasswordResetView(NextRedirectMixin, AjaxCapableProcessFormViewMixin, Form
 password_reset = PasswordResetView.as_view()
 
 
-@method_decorator(login_not_required, name="dispatch")
 class PasswordResetDoneView(TemplateView):
     template_name = "account/password_reset_done." + app_settings.TEMPLATE_EXTENSION
 
@@ -604,12 +1005,8 @@ password_reset_done = PasswordResetDoneView.as_view()
 
 
 @method_decorator(rate_limit(action="reset_password_from_key"), name="dispatch")
-@method_decorator(login_not_required, name="dispatch")
 class PasswordResetFromKeyView(
-    AjaxCapableProcessFormViewMixin,
-    NextRedirectMixin,
-    LogoutFunctionalityMixin,
-    FormView,
+    AjaxCapableProcessFormViewMixin, LogoutFunctionalityMixin, FormView
 ):
     template_name = "account/password_reset_from_key." + app_settings.TEMPLATE_EXTENSION
     form_class = ResetPasswordKeyForm
@@ -628,10 +1025,8 @@ class PasswordResetFromKeyView(
         user_token_form_class = get_form_class(
             app_settings.FORMS, "user_token", UserTokenForm
         )
-        is_ajax = get_adapter().is_ajax(request)
-        if self.key == self.reset_url_key or is_ajax:
-            if not is_ajax:
-                self.key = self.request.session.get(INTERNAL_RESET_SESSION_KEY, "")
+        if self.key == self.reset_url_key:
+            self.key = self.request.session.get(INTERNAL_RESET_SESSION_KEY, "")
             # (Ab)using forms here to be able to handle errors in XHR #890
             token_form = user_token_form_class(data={"uidb36": uidb36, "key": self.key})
             if token_form.is_valid():
@@ -647,7 +1042,9 @@ class PasswordResetFromKeyView(
                     self.logout()
                     self.request.session[INTERNAL_RESET_SESSION_KEY] = self.key
 
-                return super().dispatch(request, uidb36, self.key, **kwargs)
+                return super(PasswordResetFromKeyView, self).dispatch(
+                    request, uidb36, self.key, **kwargs
+                )
         else:
             token_form = user_token_form_class(data={"uidb36": uidb36, "key": self.key})
             if token_form.is_valid():
@@ -656,9 +1053,7 @@ class PasswordResetFromKeyView(
                 # avoids the possibility of leaking the key in the
                 # HTTP Referer header.
                 self.request.session[INTERNAL_RESET_SESSION_KEY] = self.key
-                redirect_url = self.passthrough_next_url(
-                    self.request.path.replace(self.key, self.reset_url_key)
-                )
+                redirect_url = self.request.path.replace(self.key, self.reset_url_key)
                 return redirect(redirect_url)
 
         self.reset_user = None
@@ -684,19 +1079,40 @@ class PasswordResetFromKeyView(
 
     def form_valid(self, form):
         form.save()
-        flows.password_reset.finalize_password_reset(self.request, self.reset_user)
+        adapter = get_adapter(self.request)
+
+        if self.reset_user and app_settings.LOGIN_ATTEMPTS_LIMIT:
+            # User successfully reset the password, clear any
+            # possible cache entries for all email addresses.
+            for email in self.reset_user.emailaddress_set.all():
+                adapter._delete_login_attempts_cached_email(
+                    self.request, email=email.email
+                )
+
+        adapter.add_message(
+            self.request,
+            messages.SUCCESS,
+            "account/messages/password_changed.txt",
+        )
+        signals.password_reset.send(
+            sender=self.reset_user.__class__,
+            request=self.request,
+            user=self.reset_user,
+        )
+
         if app_settings.LOGIN_ON_PASSWORD_RESET:
             return perform_login(
                 self.request,
                 self.reset_user,
+                email_verification=app_settings.EMAIL_VERIFICATION,
             )
+
         return super(PasswordResetFromKeyView, self).form_valid(form)
 
 
 password_reset_from_key = PasswordResetFromKeyView.as_view()
 
 
-@method_decorator(login_not_required, name="dispatch")
 class PasswordResetFromKeyDoneView(TemplateView):
     template_name = (
         "account/password_reset_from_key_done." + app_settings.TEMPLATE_EXTENSION
@@ -706,8 +1122,9 @@ class PasswordResetFromKeyDoneView(TemplateView):
 password_reset_from_key_done = PasswordResetFromKeyDoneView.as_view()
 
 
-class LogoutView(NextRedirectMixin, LogoutFunctionalityMixin, TemplateView):
+class LogoutView(TemplateResponseMixin, LogoutFunctionalityMixin, View):
     template_name = "account/logout." + app_settings.TEMPLATE_EXTENSION
+    redirect_field_name = REDIRECT_FIELD_NAME
 
     def get(self, *args, **kwargs):
         if app_settings.LOGOUT_ON_GET:
@@ -721,20 +1138,31 @@ class LogoutView(NextRedirectMixin, LogoutFunctionalityMixin, TemplateView):
 
     def post(self, *args, **kwargs):
         url = self.get_redirect_url()
-        self.logout()
+        if self.request.user.is_authenticated:
+            self.logout()
         response = redirect(url)
         return _ajax_response(self.request, response)
 
-    def get_redirect_url(self):
-        return self.get_next_url() or get_adapter(self.request).get_logout_redirect_url(
-            self.request
+    def get_context_data(self, **kwargs):
+        ctx = kwargs
+        redirect_field_value = get_request_param(self.request, self.redirect_field_name)
+        ctx.update(
+            {
+                "redirect_field_name": self.redirect_field_name,
+                "redirect_field_value": redirect_field_value,
+            }
         )
+        return ctx
+
+    def get_redirect_url(self):
+        return get_next_redirect_url(
+            self.request, self.redirect_field_name
+        ) or get_adapter(self.request).get_logout_redirect_url(self.request)
 
 
 logout = LogoutView.as_view()
 
 
-@method_decorator(login_not_required, name="dispatch")
 class AccountInactiveView(TemplateView):
     template_name = "account/account_inactive." + app_settings.TEMPLATE_EXTENSION
 
@@ -742,167 +1170,36 @@ class AccountInactiveView(TemplateView):
 account_inactive = AccountInactiveView.as_view()
 
 
-@method_decorator(login_not_required, name="dispatch")
-class EmailVerificationSentView(TemplateView):
-    template_name = "account/verification_sent." + app_settings.TEMPLATE_EXTENSION
+# class EmailVerificationSentView(TemplateView):
+#     template_name = "account/verification_sent." + app_settings.TEMPLATE_EXTENSION
 
 
-class ConfirmEmailVerificationCodeView(FormView):
-    template_name = (
-        "account/confirm_email_verification_code." + app_settings.TEMPLATE_EXTENSION
-    )
-    form_class = ConfirmEmailVerificationCodeForm
+# email_verification_sent = EmailVerificationSentView.as_view()
+
+
+class ReauthenticateView(FormView):
+    form_class = ReauthenticateForm
+    template_name = "account/reauthenticate." + app_settings.TEMPLATE_EXTENSION
+    redirect_field_name = REDIRECT_FIELD_NAME
 
     def dispatch(self, request, *args, **kwargs):
-        self.stage = LoginStageController.enter(request, EmailVerificationStage.key)
-        self.verification, self.pending_verification = (
-            flows.email_verification_by_code.get_pending_verification(
-                request, peek=True
-            )
-        )
-        # preventing enumeration?
-        verification_is_fake = (
-            self.pending_verification and "code" not in self.pending_verification
-        )
-        # Can we at all continue?
-        if (
-            # No verification pending?
-            (
-                not self.pending_verification
-            )  # Anonymous, yet no stage (or fake verifcation)?
-            or (
-                request.user.is_anonymous
-                and not self.stage
-                and not verification_is_fake
-            )
-        ):
-            return HttpResponseRedirect(
-                reverse(
-                    "account_login" if request.user.is_anonymous else "account_email"
-                )
-            )
-        return super().dispatch(request, *args, **kwargs)
-
-    def get_form_class(self):
-        return get_form_class(
-            app_settings.FORMS, "confirm_email_verification_code", self.form_class
-        )
-
-    def get_form_kwargs(self):
-        ret = super().get_form_kwargs()
-        ret["code"] = self.verification.key if self.verification else ""
-        return ret
-
-    def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        ret["email"] = self.pending_verification["email"]
-        ret["cancel_url"] = None if self.stage else reverse("account_email")
-        return ret
-
-    def form_valid(self, form):
-        email_address = self.verification.confirm(self.request)
-        if self.stage:
-            if not email_address:
-                return self.stage.abort()
-            return self.stage.exit()
-        if not email_address:
-            url = reverse("account_email")
-        else:
-            url = get_adapter(self.request).get_email_verification_redirect_url(
-                email_address
-            )
-        return HttpResponseRedirect(url)
-
-    def form_invalid(self, form):
-        attempts_left = flows.email_verification_by_code.record_invalid_attempt(
-            self.request, self.pending_verification
-        )
-        if attempts_left:
-            return super().form_invalid(form)
-        adapter = get_adapter(self.request)
-        adapter.add_message(
-            self.request,
-            messages.ERROR,
-            message=adapter.error_messages["too_many_login_attempts"],
-        )
-        return HttpResponseRedirect(reverse("account_login"))
-
-
-@method_decorator(login_not_required, name="dispatch")
-def email_verification_sent(request):
-    if app_settings.EMAIL_VERIFICATION_BY_CODE_ENABLED:
-        return ConfirmEmailVerificationCodeView.as_view()(request)
-    else:
-        return EmailVerificationSentView.as_view()(request)
-
-
-class BaseReauthenticateView(NextRedirectMixin, FormView):
-    def dispatch(self, request, *args, **kwargs):
-        resp = self._check_reauthentication_method_available(request)
-        if resp:
-            return resp
-        resp = self._check_ratelimit(request)
-        if resp:
-            return resp
-        return super().dispatch(request, *args, **kwargs)
-
-    def _check_ratelimit(self, request):
-        return ratelimit.consume_or_429(
+        r429 = ratelimit.consume_or_429(
             self.request,
             action="reauthenticate",
             user=self.request.user,
         )
-
-    def _check_reauthentication_method_available(self, request):
-        methods = get_adapter().get_reauthentication_methods(self.request.user)
-        if any([m["url"] == request.path for m in methods]):
-            # Method is available
-            return None
-        if not methods:
-            # Reauthentication not available
-            raise PermissionDenied("Reauthentication not available")
-        url = self.passthrough_next_url(methods[0]["url"])
-        return HttpResponseRedirect(url)
-
-    def get_default_success_url(self):
-        url = get_adapter(self.request).get_login_redirect_url(self.request)
-        return url
-
-    def form_valid(self, form):
-        response = flows.reauthentication.resume_request(self.request)
-        if response:
-            return response
-        return super().form_valid(form)
-
-    def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        ret.update(
-            {
-                "reauthentication_alternatives": self.get_reauthentication_alternatives(),
-            }
-        )
-        return ret
-
-    def get_reauthentication_alternatives(self):
-        methods = get_adapter().get_reauthentication_methods(self.request.user)
-        alts = []
-        for method in methods:
-            alt = dict(method)
-            if self.request.path == alt["url"]:
-                continue
-            alt["url"] = self.passthrough_next_url(alt["url"])
-            alts.append(alt)
-        alts = sorted(alts, key=lambda alt: alt["description"])
-        return alts
-
-
-@method_decorator(login_required, name="dispatch")
-class ReauthenticateView(BaseReauthenticateView):
-    form_class = ReauthenticateForm
-    template_name = "account/reauthenticate." + app_settings.TEMPLATE_EXTENSION
+        if r429:
+            return r429
+        return super().dispatch(request, *args, **kwargs)
 
     def get_form_class(self):
         return get_form_class(app_settings.FORMS, "reauthenticate", self.form_class)
+
+    def get_success_url(self):
+        url = get_next_redirect_url(self.request, self.redirect_field_name)
+        if not url:
+            url = get_adapter(self.request).get_login_redirect_url(self.request)
+        return url
 
     def get_form_kwargs(self):
         ret = super().get_form_kwargs()
@@ -910,115 +1207,22 @@ class ReauthenticateView(BaseReauthenticateView):
         return ret
 
     def form_valid(self, form):
-        flows.reauthentication.reauthenticate_by_password(self.request)
+        record_authentication(self.request, self.request.user)
+        response = resume_request(self.request)
+        if response:
+            return response
         return super().form_valid(form)
 
-
-reauthenticate = ReauthenticateView.as_view()
-
-
-class RequestLoginCodeView(RedirectAuthenticatedUserMixin, NextRedirectMixin, FormView):
-    form_class = RequestLoginCodeForm
-    template_name = "account/request_login_code." + app_settings.TEMPLATE_EXTENSION
-
-    def get_form_class(self):
-        return get_form_class(app_settings.FORMS, "request_login_code", self.form_class)
-
-    def form_valid(self, form):
-        flows.login_by_code.request_login_code(self.request, form.cleaned_data["email"])
-        return super().form_valid(form)
-
-    def get_success_url(self):
-        if self.request.user.is_authenticated:
-            return None
-        url = reverse_lazy("account_confirm_login_code")
-        url = self.passthrough_next_url(reverse("account_confirm_login_code"))
-        return url
-
     def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        site = get_current_site(self.request)
-        ret.update({"site": site})
-        return ret
-
-
-request_login_code = RequestLoginCodeView.as_view()
-
-
-def _login_by_code_urlname():
-    # NOTE: Having this as a method instead of a constant allows changing
-    # settings in test cases...
-    return (
-        "account_request_login_code"
-        if app_settings.LOGIN_BY_CODE_ENABLED
-        else "account_login"
-    )
-
-
-@method_decorator(
-    login_stage_required(
-        stage=LoginByCodeStage.key, redirect_urlname=(_login_by_code_urlname())
-    ),
-    name="dispatch",
-)
-class ConfirmLoginCodeView(NextRedirectMixin, FormView):
-    form_class = ConfirmLoginCodeForm
-    template_name = "account/confirm_login_code." + app_settings.TEMPLATE_EXTENSION
-
-    @method_decorator(never_cache)
-    def dispatch(self, request, *args, **kwargs):
-        self.stage = request._login_stage
-        self.user, self.pending_login = flows.login_by_code.get_pending_login(
-            self.request, self.stage.login, peek=True
-        )
-        if not self.pending_login:
-            return HttpResponseRedirect(reverse(_login_by_code_urlname()))
-        return super().dispatch(request, *args, **kwargs)
-
-    def get_form_class(self):
-        return get_form_class(app_settings.FORMS, "confirm_login_code", self.form_class)
-
-    def get_form_kwargs(self):
-        kwargs = super().get_form_kwargs()
-        kwargs["code"] = self.pending_login.get("code", "")
-        return kwargs
-
-    def form_valid(self, form):
-        redirect_url = self.get_next_url()
-        return flows.login_by_code.perform_login_by_code(
-            self.request, self.stage, redirect_url
-        )
-
-    def form_invalid(self, form):
-        attempts_left = flows.login_by_code.record_invalid_attempt(
-            self.request, self.stage.login
-        )
-        if attempts_left:
-            return super().form_invalid(form)
-        adapter = get_adapter(self.request)
-        adapter.add_message(
-            self.request,
-            messages.ERROR,
-            message=adapter.error_messages["too_many_login_attempts"],
-        )
-        return HttpResponseRedirect(
-            reverse(
-                _login_by_code_urlname()
-                if self.pending_login["initiated_by_user"]
-                else "account_login"
-            )
-        )
-
-    def get_context_data(self, **kwargs):
-        ret = super().get_context_data(**kwargs)
-        site = get_current_site(self.request)
+        ret = super(ReauthenticateView, self).get_context_data(**kwargs)
+        redirect_field_value = get_request_param(self.request, self.redirect_field_name)
         ret.update(
             {
-                "site": site,
-                "email": self.pending_login["email"],
+                "redirect_field_name": self.redirect_field_name,
+                "redirect_field_value": redirect_field_value,
             }
         )
         return ret
 
 
-confirm_login_code = ConfirmLoginCodeView.as_view()
+reauthenticate = login_required(ReauthenticateView.as_view())
